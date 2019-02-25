@@ -110,9 +110,10 @@ from __future__ import division, print_function
 
 __author__ = 'Wijnand Modderman <maze@pyth0n.org>'
 __copyright__ = ['Copyright (c) 2010 Wijnand Modderman',
-                 'Copyright (c) 1981 Chuck Forsberg']
+                 'Copyright (c) 1981 Chuck Forsberg',
+                 'Copyright (c) 2016 Michael Tesch']
 __license__ = 'MIT'
-__version__ = '0.4.4'
+__version__ = '0.4.5'
 
 import platform
 import logging
@@ -121,6 +122,7 @@ import sys
 from functools import partial
 
 # Protocol bytes
+NUL = b'\x00'
 SOH = b'\x01'
 STX = b'\x02'
 EOT = b'\x04'
@@ -133,21 +135,32 @@ CRC = b'C'
 
 class XMODEM(object):
     '''
-    XMODEM Protocol handler, expects an object to read from and an object to
-    write to.
+    XMODEM Protocol handler, expects two callables which encapsulate the read
+        and write operations on the underlying stream.
 
+    Example functions for reading and writing to a serial line:
+
+    >>> import serial
+    >>> from xmodem import XMODEM
+    >>> ser = serial.Serial('/dev/ttyUSB0', timeout=0) # or whatever you need
     >>> def getc(size, timeout=1):
-    ...     return data or None
+    ...     return ser.read(size) or None
     ...
     >>> def putc(data, timeout=1):
-    ...     return size or None
+    ...     return ser.write(data) or None
     ...
     >>> modem = XMODEM(getc, putc)
 
 
-    :param getc: Function to retrieve bytes from a stream
+    :param getc: Function to retrieve bytes from a stream. The function takes
+        the number of bytes to read from the stream and a timeout in seconds as
+        parameters. It must return the bytes which were read, or ``None`` if a
+        timeout occured.
     :type getc: callable
-    :param putc: Function to transmit bytes to a stream
+    :param putc: Function to transmit bytes to a stream. The function takes the
+        bytes to be written and a timeout in seconds as parameters. It must
+        return the number of bytes written to the stream, or ``None`` in case of
+        a timeout.
     :type putc: callable
     :param mode: XMODEM protocol mode
     :type mode: string
@@ -202,6 +215,11 @@ class XMODEM(object):
     def abort(self, count=2, timeout=60):
         '''
         Send an abort sequence using CAN bytes.
+
+        :param count: how many abort characters to send
+        :type count: int
+        :param timeout: timeout in seconds
+        :type timeout: int
         '''
         for _ in range(count):
             self.putc(CAN, timeout)
@@ -241,6 +259,7 @@ class XMODEM(object):
             packet_size = dict(
                 xmodem    = 128,
                 xmodem1k  = 1024,
+                ymodem    = 1024,
             )[self.mode]
         except KeyError:
             raise ValueError("Invalid mode specified: {self.mode!r}"
@@ -286,20 +305,55 @@ class XMODEM(object):
         error_count = 0
         success_count = 0
         total_packets = 0
-        sequence = 1
+        if self.mode == 'ymodem':
+            sequence = 0
+            filenames = stream
+        else:
+            sequence = 1
         while True:
-            data = stream.read(packet_size)
-            if not data:
-                # end of stream
-                self.log.debug('send: at EOF')
-                break
-            total_packets += 1
+            # build packet
+            if self.mode == 'ymodem' and success_count == 0:
+                # send packet sequence 0 containing:
+                #  Filename Length [Modification-Date [Mode [Serial-Number]]]
+                # 'stream' is actually the filename
+                import os
+                if len(filenames):
+                    filename = filenames.pop()
+                    stream = open(filename, 'rb')
+                    stat = os.stat(filename)
+                    data = os.path.basename(filename).encode() + NUL + str(stat.st_size).encode()
+                    self.log.debug('ymodem sending : "%s" len:%d', filename, stat.st_size)
+                else:
+                    # empty file name packet terminates transmission
+                    filename = ''
+                    data = ''.encode()
+                    stream = None
+                    self.log.debug('ymodem done, sending empty header.')
+                if len(data) <= 128:
+                    header_size = 128
+                else:
+                    header_size = 1024
 
-            header = self._make_send_header(packet_size, sequence)
-            data = data.ljust(packet_size, self.pad)
-            checksum = self._make_send_checksum(crc_mode, data)
+                header = self._make_send_header(header_size, sequence)
+                data = data.ljust(header_size, NUL)
+                checksum = self._make_send_checksum(crc_mode, data)
+            else:
+                # happens after sending ymodem empty filename
+                if not stream:
+                    return True
+                # normal data packet
+                data = stream.read(packet_size)
+                if not data:
+                    # end of stream
+                    self.log.debug('send: at EOF')
+                    break
+                total_packets += 1
 
-            # emit packet
+                header = self._make_send_header(packet_size, sequence)
+                data = data.ljust(packet_size, self.pad)
+                checksum = self._make_send_checksum(crc_mode, data)
+
+            # emit packet & get ACK
             while True:
                 self.log.debug('send: block %d', sequence)
                 self.putc(header + data + checksum)
@@ -309,7 +363,16 @@ class XMODEM(object):
                     if callable(callback):
                         callback(total_packets, success_count, error_count)
                     error_count = 0
-                    break
+                    if self.mode == 'ymodem' and success_count == 1 and len(filename):
+                        char = self.getc(1, timeout)
+                        if char == DLE: # dunno why
+                            char = self.getc(1, timeout)
+                        if char == CRC:
+                            break
+                        self.log.error('send error: ymodem expected CRC; got %r for block %d',
+                                       char, sequence)
+                    else:
+                        break
 
                 self.log.error('send error: expected ACK; got %r for block %d',
                                char, sequence)
@@ -327,6 +390,7 @@ class XMODEM(object):
             # keep track of sequence
             sequence = (sequence + 1) % 0x100
 
+        # emit EOT and get corresponding ACK
         while True:
             self.log.debug('sending EOT, awaiting ACK')
             # end of transmission
@@ -345,6 +409,11 @@ class XMODEM(object):
                     return False
 
         self.log.info('Transmission successful (ACK received).')
+        if self.mode == 'ymodem':
+            # YMODEM - recursively send next file
+            # or empty filename header to end the xfer batch.
+            stream.close()
+            return self.send(filenames, retry, timeout, quiet, callback)
         return True
 
     def _make_send_header(self, packet_size, sequence):
@@ -377,6 +446,22 @@ class XMODEM(object):
 
         Returns the number of bytes received on success or ``None`` in case of
         failure.
+
+        :param stream: The stream object to write data to.
+        :type stream: stream (file, etc.)
+        :param crc_mode: XMODEM CRC mode
+        :type crc_mode: int
+        :param retry: The maximum number of times to try to resend a failed
+                      packet before failing.
+        :type retry: int
+        :param timeout: The number of seconds to wait for a response before
+                        timing out.
+        :type timeout: int
+        :param delay: The number of seconds to wait between resend attempts
+        :type delay: int
+        :param quiet: If ``True``, write transfer information to stderr.
+        :type quiet: bool
+
         '''
 
         # initiate protocol
@@ -528,7 +613,6 @@ class XMODEM(object):
                 data = self.getc(1, timeout=1)
                 if data is None:
                     break
-                assert False, data
             self.putc(NAK)
             # get next start-of-header byte
             char = self.getc(1, timeout)
@@ -593,6 +677,7 @@ class XMODEM(object):
 
 
 XMODEM1k = partial(XMODEM, mode='xmodem1k')
+YMODEM = partial(XMODEM, mode='ymodem')
 
 
 def run():
@@ -602,13 +687,15 @@ def run():
     parser = optparse.OptionParser(
         usage='%prog [<options>] <send|recv> filename filename')
     parser.add_option('-m', '--mode', default='xmodem',
-                      help='XMODEM mode (xmodem, xmodem1k)')
+                      help='XMODEM mode (xmodem, xmodem1k, ymodem)')
 
     options, args = parser.parse_args()
-    if len(args) != 3:
+    if options.mode != 'ymodem' and len(args) != 3:
         parser.error('invalid arguments')
         return 1
-
+    elif len(args) < 2:
+        parser.error('invalid arguments')
+        return 1
     elif args[0] not in ('send', 'recv'):
         parser.error('invalid mode')
         return 1
@@ -658,12 +745,22 @@ def run():
         stream.close()
 
     elif args[0] == 'send':
-        getc, putc = _func(*_pipe('rz', '--xmodem', args[2]))
-        stream = open(args[1], 'rb')
+        rzargs = ['rz']
+        if options.mode == 'ymodem':
+            rzargs += ['--ymodem']
+        else:
+            rzargs += ['--xmodem']
+            rzargs += args[2]
+        getc, putc = _func(*_pipe(*rzargs))
+        if options.mode != 'ymodem':
+            stream = open(args[1], 'rb')
+        else:
+            stream = args[1:]
         xmodem = XMODEM(getc, putc, mode=options.mode)
         sent = xmodem.send(stream, retry=8)
         assert sent is not None, ('Transfer failed, sent is', sent)
-        stream.close()
+        if options.mode != 'ymodem':
+            stream.close()
 
 if __name__ == '__main__':
     sys.exit(run())
