@@ -205,8 +205,23 @@ class XMODEM(object):
         0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0,
     ]
 
+    def getc(self, n, timeout):
+        '''
+        currently only works if n is one
+        '''
+        assert(n==1)
+        while True:
+            char = self._getc(n, timeout)
+            if char == b'\r':
+                pass
+            elif char == b'\n':
+                pass
+            else:
+                break
+        return char
+
     def __init__(self, getc, putc, mode='xmodem', pad=b'\x1a'):
-        self.getc = getc
+        self._getc = getc
         self.putc = putc
         self.mode = mode
         self.pad = pad
@@ -270,7 +285,7 @@ class XMODEM(object):
         crc_mode = 0
         cancel = 0
         while True:
-            char = self.getc(1)
+            char = self.getc(1, timeout)
             if char:
                 if char == NAK:
                     self.log.debug('standard checksum requested (NAK).')
